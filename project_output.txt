@@ -1,0 +1,1321 @@
+--- BEGIN FILE: ./cmd/news/main.go ---
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"log/slog"
+	"net"
+	"net/http"
+	"news/internal/adapter/fetcher"
+	"news/internal/adapter/parser"
+	"news/internal/config"
+	"news/internal/logger"
+	"news/internal/migrations"
+	httpserver "news/internal/transport/http"
+	"news/internal/usecase"
+	"news/storage"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	cfg, err := config.Load("config.json")
+	if err != nil {
+		log.Fatalf("FATAL: could not load config: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("FATAL: invalid config: %v", err)
+	}
+	appLogger, err := logger.New(cfg.Logger)
+	if err != nil {
+		log.Fatalf("FATAL: could not setup logger: %v", err)
+	}
+	slog.SetDefault(appLogger)
+	slog.Info("Starting News Aggregator",
+		slog.String("component", "app"),
+		slog.Int("feed_count", len(cfg.App.FeedURLs)),
+		slog.String("processing_interval", cfg.App.ProcessingInterval),
+	)
+	dbPool, err := pgxpool.New(context.Background(), cfg.Database.DSN())
+	if err != nil {
+		slog.Error("Database connection failed",
+			slog.String("component", "database"),
+			slog.Any("error", err),
+		)
+		os.Exit(1)
+	}
+	defer dbPool.Close()
+	if err := dbPool.Ping(context.Background()); err != nil {
+		slog.Error("Database ping failed",
+			slog.String("component", "database"),
+			slog.Any("error", err),
+		)
+		os.Exit(1)
+	}
+	slog.Info("Database connection established", slog.String("component", "database"))
+	if err := migrations.Apply(context.Background(), appLogger, dbPool); err != nil {
+		slog.Error("Database migration failed",
+			slog.String("component", "database"),
+			slog.Any("error", err),
+		)
+		os.Exit(1)
+	}
+	feedNames := make(map[string]string)
+	urls := make([]string, 0, len(cfg.App.FeedURLs))
+	for _, feed := range cfg.App.FeedURLs {
+		feedNames[feed.URL] = feed.Name
+		urls = append(urls, feed.URL)
+	}
+	dbStorage := storage.NewPostgresNewsDB(dbPool, cfg.App, appLogger)
+	httpFetcher := fetcher.NewHTTPFetcher(appLogger)
+	xmlParser := parser.NewXMLParser(appLogger)
+	feedProcessor := usecase.NewFeedProcessingUseCase(httpFetcher, xmlParser, dbStorage, appLogger, feedNames)
+	newsGetter := usecase.NewNewsGetterUseCase(dbStorage)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+	processingInterval, _ := time.ParseDuration(cfg.App.ProcessingInterval)
+	wg.Add(1)
+	go runWorker(ctx, &wg, feedProcessor, urls, processingInterval)
+	port, err := getFreePort(8080)
+	if err != nil {
+		slog.Error("No free port available",
+			slog.String("component", "server"),
+			slog.Any("error", err),
+		)
+		os.Exit(1)
+	}
+	cfg.Server.Address = fmt.Sprintf(":%d", port)
+	ln, err := net.Listen("tcp", cfg.Server.Address)
+	if err != nil {
+		slog.Error("Failed to create listener",
+			slog.String("component", "server"),
+			slog.Any("error", err),
+		)
+		os.Exit(1)
+	}
+	defer ln.Close()
+	slog.Info("HTTP server ready",
+		slog.String("component", "server"),
+		slog.String("address", ln.Addr().String()),
+	)
+
+	handler := httpserver.NewHandler(appLogger, newsGetter)
+	router := httpserver.NewServer(appLogger, handler)
+	httpServer := &http.Server{
+		Addr:    cfg.Server.Address,
+		Handler: router,
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		slog.Info("HTTP server starting",
+			slog.String("component", "server"),
+			slog.String("address", httpServer.Addr),
+		)
+		if err := httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+			slog.Error("HTTP server failed",
+				slog.String("component", "server"),
+				slog.Any("error", err),
+			)
+			cancel()
+		} else {
+			slog.Info("HTTP server stopped", slog.String("component", "server"))
+		}
+	}()
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	select {
+	case sig := <-stop:
+		slog.Info("Shutdown signal received",
+			slog.String("component", "app"),
+			slog.String("signal", sig.String()),
+		)
+		time.Sleep(500 * time.Millisecond)
+	case <-ctx.Done():
+		slog.Warn("Context cancelled, initiating shutdown", slog.String("component", "app"))
+	}
+	cancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		slog.Error("HTTP server shutdown failed",
+			slog.String("component", "server"),
+			slog.Any("error", err),
+		)
+	} else {
+		slog.Info("HTTP server stopped gracefully", slog.String("component", "server"))
+	}
+
+	wg.Wait()
+	slog.Info("Application stopped", slog.String("component", "app"))
+}
+func runWorker(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	processor *usecase.FeedProcessingUseCase,
+	urls []string,
+	interval time.Duration,
+) {
+	defer wg.Done()
+	slog.Info("Feed processing worker started",
+		slog.String("component", "worker"),
+		slog.String("interval", interval.String()),
+		slog.Int("feed_count", len(urls)),
+	)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	processAllFeeds(ctx, processor, urls)
+	for {
+		select {
+		case <-ticker.C:
+			processAllFeeds(ctx, processor, urls)
+		case <-ctx.Done():
+			slog.Info("Worker stopping", slog.String("component", "worker"))
+			return
+		}
+	}
+}
+func processAllFeeds(ctx context.Context, processor *usecase.FeedProcessingUseCase, urls []string) {
+	start := time.Now()
+	slog.Info("Feed processing cycle started",
+		slog.String("component", "worker"),
+		slog.Int("feeds_to_process", len(urls)),
+	)
+	var wg sync.WaitGroup
+	successCount := 0
+	errorCount := 0
+	var mu sync.Mutex
+	for _, url := range urls {
+		wg.Add(1)
+		go func(u string) {
+			defer wg.Done()
+			opCtx, opCancel := context.WithTimeout(ctx, 30*time.Second)
+			defer opCancel()
+
+			if err := processor.ProcessFeed(opCtx, u); err != nil {
+				mu.Lock()
+				errorCount++
+				mu.Unlock()
+				slog.Error("Feed processing failed",
+					slog.String("component", "worker"),
+					slog.String("url", u),
+					slog.Any("error", err),
+				)
+			} else {
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+			}
+		}(url)
+	}
+	wg.Wait()
+	duration := time.Since(start)
+	slog.Info("Feed processing cycle completed",
+		slog.String("component", "worker"),
+		slog.Int("successful", successCount),
+		slog.Int("errors", errorCount),
+		slog.Int("total", len(urls)),
+		slog.Duration("duration", duration),
+	)
+}
+func getFreePort(startPort int) (int, error) {
+	for port := startPort; port < startPort+100; port++ {
+		address := fmt.Sprintf(":%d", port)
+		listener, err := net.Listen("tcp", address)
+		if err == nil {
+			listener.Close()
+			return port, nil
+		}
+	}
+	return 0, fmt.Errorf("no free ports found in range %d-%d", startPort, startPort+100)
+}
+
+--- END FILE: ./cmd/news/main.go ---
+
+--- BEGIN FILE: ./storage/postgres.go ---
+package storage
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"news/internal/config"
+	"news/internal/domain"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type PostgresNewsDB struct {
+	pool             *pgxpool.Pool
+	log              *slog.Logger
+	defaultNewsLimit int
+}
+
+func NewPostgresNewsDB(pool *pgxpool.Pool, appCfg config.AppConfig, log *slog.Logger) *PostgresNewsDB {
+	log.Info("Initializing Postgres news storage")
+	return &PostgresNewsDB{
+		pool:             pool,
+		log:              log,
+		defaultNewsLimit: appCfg.DefaultNewsLimit,
+	}
+}
+func (db *PostgresNewsDB) Close() {
+	db.log.Info("Closing database connection pool")
+	db.pool.Close()
+}
+
+// SaveNews
+func (db *PostgresNewsDB) SaveNews(ctx context.Context, feed *domain.Feed) (int, error) {
+	if len(feed.Items) == 0 {
+		return 0, nil
+	}
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		db.log.Error(
+			"Failed to begin transaction",
+			slog.Any("error", err),
+		)
+		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			if rollbackErr := tx.Rollback(context.Background()); rollbackErr != nil {
+				db.log.Error("Failed to rollback transaction", slog.Any("error", rollbackErr))
+			}
+		}
+	}()
+	batch := &pgx.Batch{}
+	query := `
+	INSERT INTO news (title, content, pub_date, link)
+	VALUES ($1, $2, $3, $4)
+	ON CONFLICT (link) DO NOTHING;
+	`
+	for _, item := range feed.Items {
+		batch.Queue(
+			query,
+			item.Title,
+			item.Description,
+			item.PubDate,
+			item.Link,
+		)
+	}
+	batchResult := tx.SendBatch(ctx, batch)
+	if err := batchResult.Close(); err != nil {
+		db.log.Error(
+			"Failed to execute batch",
+			slog.Any("error", err),
+		)
+		return 0, fmt.Errorf("failed to execute batch: %w", err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		db.log.Error("Failed to commit transacion", slog.Any("error", err))
+		return 0, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+	return len(feed.Items), nil
+}
+func (db *PostgresNewsDB) GetNews(ctx context.Context, n int) ([]domain.Item, error) {
+	limit := n
+	if limit <= 0 {
+		limit = db.defaultNewsLimit
+	}
+	log := db.log.With(slog.Int("limit", limit))
+	const op = "storage.postgres.GetNews"
+	log = log.With(slog.String("op", op))
+	query := `
+	SELECT id, title, content, pub_date, link
+	FROM news
+	ORDER BY pub_date DESC
+	LIMIT $1;
+	`
+	rows, err := db.pool.Query(ctx, query, limit)
+	if err != nil {
+		log.Error("Database query failed", slog.Any("error", err))
+		return nil, fmt.Errorf("%s: failed to execute query: %w", op, err)
+	}
+	defer rows.Close()
+	items, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (domain.Item, error) {
+		var item domain.Item
+		var id int
+		err := row.Scan(
+			&id,
+			&item.Title,
+			&item.Description,
+			&item.PubDate,
+			&item.Link,
+		)
+		return item, err
+	})
+	if err != nil {
+		log.Error("Failed to collect rows", slog.Any("error", err))
+		return nil, fmt.Errorf("%s: failed to scan row: %w", op, err)
+	}
+	log.Info("Successfully retrieved news items", slog.Int("count", len(items)))
+	return items, nil
+}
+
+--- END FILE: ./storage/postgres.go ---
+
+--- BEGIN FILE: ./storage/interface.go ---
+package storage
+
+import (
+	"context"
+	"news/internal/domain"
+)
+
+type Storage interface {
+	SaveNews(ctx context.Context, feed *domain.Feed) (int, error)
+	GetNews(ctx context.Context, n int) ([]domain.Item, error)
+	Close()
+}
+
+--- END FILE: ./storage/interface.go ---
+
+--- BEGIN FILE: ./config.json ---
+{
+    "server": {
+        "address": ":8080"
+    },
+    "logger": {
+        "level": "info"
+    },
+    "app": {
+        "default_news_limit": 10,
+        "processing_interval": "3m",
+        "feed_urls": [
+            "https://dev.to/feed",
+            "http://feeds.bbci.co.uk/news/rss.xml",
+            "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+            "https://ria.ru/export/rss2/index.xml",
+            "https://www.kommersant.ru/RSS/news.xml"
+        ]
+    },
+    "database": {
+        "host": "localhost",
+        "port": 5432,
+        "username": "news",
+        "password": "password",
+        "dbname": "news_db",
+        "sslmode": "disable"
+    }
+}
+--- END FILE: ./config.json ---
+
+--- BEGIN FILE: ./internal/logger/logger.go ---
+package logger
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"news/internal/config"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+const (
+	logFile      = "news.log"
+	errorLogFile = "news_error.log"
+)
+
+func New(cfg config.LoggerConfig) (*slog.Logger, error) {
+	logLevel := parseLogLevel(cfg.Level)
+	logWriter, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open log file %s: %w", logFile, err)
+	}
+	errorWriter, err := os.OpenFile(errorLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open error log file %s: %v", errorLogFile, err)
+	}
+	handler := NewLevelDispatcherHandler(logWriter, errorWriter, &slog.HandlerOptions{
+		AddSource: true,
+		Level:     logLevel,
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.SourceKey {
+				if source, ok := a.Value.Any().(*slog.Source); ok {
+					source.File = filepath.Base(source.File)
+				}
+			}
+			return a
+		},
+	})
+	return slog.New(handler), nil
+}
+
+// parseLogLevel преобразует строку из конфига в уровень slog.
+func parseLogLevel(levelStr string) slog.Level {
+	switch levelStr {
+	case "debug":
+		return slog.LevelDebug
+	case "info":
+		return slog.LevelInfo
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+
+type LevelDispatcherHandler struct {
+	defaultHandler slog.Handler
+	errorHandlers  slog.Handler
+}
+
+func NewLevelDispatcherHandler(defaultOut, errorOut io.Writer, opts *slog.HandlerOptions) *LevelDispatcherHandler {
+	return &LevelDispatcherHandler{
+		defaultHandler: NewReadableHandler(defaultOut, opts),
+		errorHandlers:  NewReadableHandler(errorOut, opts),
+	}
+}
+func (h *LevelDispatcherHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.defaultHandler.Enabled(ctx, level)
+}
+func (h *LevelDispatcherHandler) Handle(ctx context.Context, r slog.Record) error {
+	if r.Level >= slog.LevelError {
+		return h.errorHandlers.Handle(ctx, r)
+	}
+	return h.defaultHandler.Handle(ctx, r)
+}
+func (h *LevelDispatcherHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &LevelDispatcherHandler{
+		defaultHandler: h.defaultHandler.WithAttrs(attrs),
+		errorHandlers:  h.errorHandlers.WithAttrs(attrs),
+	}
+}
+func (h *LevelDispatcherHandler) WithGroup(name string) slog.Handler {
+	return &LevelDispatcherHandler{
+		defaultHandler: h.defaultHandler.WithGroup(name),
+		errorHandlers:  h.errorHandlers.WithGroup(name),
+	}
+}
+
+type ReadableHandler struct {
+	w    io.Writer
+	opts *slog.HandlerOptions
+}
+
+func NewReadableHandler(w io.Writer, opts *slog.HandlerOptions) *ReadableHandler {
+	if opts == nil {
+		opts = &slog.HandlerOptions{}
+	}
+	return &ReadableHandler{w: w, opts: opts}
+}
+func (h *ReadableHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return level >= h.opts.Level.Level()
+}
+func (h *ReadableHandler) Handle(ctx context.Context, r slog.Record) error {
+	timeStr := r.Time.Format("15:04:05.000")
+	levelStr := h.formatLevel(r.Level)
+	var component, operation, source string
+	var attrs []slog.Attr
+	r.Attrs(func(a slog.Attr) bool {
+		switch a.Key {
+		case "component":
+			component = a.Value.String()
+		case "op":
+			operation = a.Value.String()
+		case slog.SourceKey:
+			if sourceVal, ok := a.Value.Any().(*slog.Source); ok {
+				source = fmt.Sprintf("%s:%d", filepath.Base(sourceVal.File), sourceVal.Line)
+			}
+		default:
+			attrs = append(attrs, a)
+		}
+		return true
+	})
+	var prefix strings.Builder
+	prefix.WriteString(fmt.Sprintf("[%s] %s", timeStr, levelStr))
+	if component != "" {
+		prefix.WriteString(fmt.Sprintf(" [%s]", component))
+	}
+	if operation != "" {
+		prefix.WriteString(fmt.Sprintf(" (%s)", operation))
+	}
+	if source != "" && h.opts.AddSource {
+		prefix.WriteString(fmt.Sprintf(" <%s>", source))
+	}
+	message := r.Message
+	var attrParts []string
+	for _, attr := range attrs {
+		attrParts = append(attrParts, h.formatAttr(attr))
+	}
+	if len(attrParts) > 0 {
+		message += " | " + strings.Join(attrParts, ", ")
+	}
+	_, err := fmt.Fprintf(h.w, "%s: %s\n", prefix.String(), message)
+	return err
+}
+func (h *ReadableHandler) formatLevel(level slog.Level) string {
+	switch level {
+	case slog.LevelDebug:
+		return "DEBUG"
+	case slog.LevelInfo:
+		return "INFO"
+	case slog.LevelWarn:
+		return "WARN"
+	case slog.LevelError:
+		return "ERROR"
+	default:
+		return "UNKNW"
+	}
+}
+func (h *ReadableHandler) formatAttr(attr slog.Attr) string {
+	switch attr.Key {
+	case "error":
+		return fmt.Sprintf("error=%q", attr.Value.String())
+	case "url":
+		return fmt.Sprintf("url=%s", h.shortenURL(attr.Value.String()))
+	case "duration":
+		if duration, err := time.ParseDuration(attr.Value.String()); err != nil {
+			return fmt.Sprintf("took=%s", duration.Round(time.Millisecond))
+		}
+		return fmt.Sprintf("duration=%s", attr.Value.String())
+	case "count", "limit", "items_found":
+		return fmt.Sprintf("%s=%s", attr.Key, attr.Value.String())
+	default:
+		return fmt.Sprintf("%s=%s", attr.Key, attr.Value.String())
+	}
+}
+func (h *ReadableHandler) shortenURL(url string) string {
+	if len(url) > 50 {
+		parts := strings.Split(url, "/")
+		if len(parts) >= 3 {
+			return fmt.Sprintf("%s//%s/...", parts[0], parts[2])
+		}
+	}
+	return url
+}
+func (h *ReadableHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return h
+}
+func (h *ReadableHandler) WithGroup(name string) slog.Handler {
+	return h
+}
+
+--- END FILE: ./internal/logger/logger.go ---
+
+--- BEGIN FILE: ./internal/migrations/migrations.go ---
+package migrations
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sort"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type Migration struct {
+	ID    string
+	UpSQL string
+}
+
+var allMigrations = []Migration{
+	{
+		ID: "020231120120000_create_news_table",
+		UpSQL: `
+		CREATE TABLE news(
+		id serial PRIMARY KEY,
+		title TEXT NOT NULL,
+		content TEXT NOT NULL,
+		pub_date TIMESTAMPTZ NOT NULL,
+		link TEXT UNIQUE NOT NULL
+		);`,
+	},
+}
+
+// Apply применяет все необходимые миграции к базе данных.
+func Apply(ctx context.Context, log *slog.Logger, pool *pgxpool.Pool) error {
+	log = log.With(slog.String("component", "migrations"))
+	log.Info("Starting database migrations check...")
+	_, err := pool.Exec(ctx, `
+	CREATE TABLE IF NOT EXISTS schema_migrations (
+	id TEXT PRIMARY KEY
+	);
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create schema_migrations table: %w", err)
+	}
+	rows, err := pool.Query(ctx, "SELECT id FROM schema_migrations")
+	if err != nil {
+		return fmt.Errorf("failed to query applied migrations: %w", err)
+	}
+	appliedMigrations := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return fmt.Errorf("failed to scan migration id: %w", err)
+		}
+		appliedMigrations[id] = true
+	}
+	rows.Close()
+	sort.Slice(allMigrations, func(i, j int) bool {
+		return allMigrations[i].ID < allMigrations[j].ID
+	})
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	appliedCount := 0
+	for _, m := range allMigrations {
+		if !appliedMigrations[m.ID] {
+			log.Info("Applying migration", slog.String("id", m.ID))
+			if _, err := tx.Exec(ctx, m.UpSQL); err != nil {
+				return fmt.Errorf("failed to apply migration %s: %w", m.ID, err)
+			}
+			if _, err := tx.Exec(ctx, "INSERT INTO schema_migrations (id) VALUES ($1)", m.ID); err != nil {
+				return fmt.Errorf("failed to record migration %s: %w", m.ID, err)
+			}
+			appliedCount++
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit migrations tansaction: %w", err)
+	}
+	if appliedCount > 0 {
+		log.Info("Database migrations applied successfully", slog.Int("count", appliedCount))
+	} else {
+		log.Info("Database is up to date, no new migrations found.")
+	}
+	return nil
+}
+
+--- END FILE: ./internal/migrations/migrations.go ---
+
+--- BEGIN FILE: ./internal/domain/feed.go ---
+package domain
+
+import "time"
+
+type Item struct {
+	Title       string
+	Link        string
+	Description string
+	PubDate     time.Time
+}
+type Feed struct {
+	Title       string
+	Link        string
+	Description string
+	Items       []Item
+}
+
+--- END FILE: ./internal/domain/feed.go ---
+
+--- BEGIN FILE: ./internal/usecase/newsgetter.go ---
+package usecase
+
+import (
+	"context"
+	"news/internal/domain"
+)
+
+type NewsStorage interface {
+	GetNews(ctx context.Context, n int) ([]domain.Item, error)
+}
+type NewsGetterUseCase struct {
+	storage NewsStorage
+}
+
+func NewNewsGetterUseCase(s NewsStorage) *NewsGetterUseCase {
+	return &NewsGetterUseCase{storage: s}
+}
+func (us *NewsGetterUseCase) GetNews(ctx context.Context, limit int) ([]domain.Item, error) {
+	return us.storage.GetNews(ctx, limit)
+}
+
+--- END FILE: ./internal/usecase/newsgetter.go ---
+
+--- BEGIN FILE: ./internal/usecase/feedprocessing.go ---
+package usecase
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+)
+
+type FeedProcessingUseCase struct {
+	fetcher   FeedFetcher
+	parser    FeedParser
+	storage   FeedStorage
+	log       *slog.Logger
+	feedNames map[string]string
+}
+
+func NewFeedProcessingUseCase(
+	fetcher FeedFetcher,
+	parser FeedParser,
+	storage FeedStorage,
+	log *slog.Logger,
+	feedNames map[string]string,
+) *FeedProcessingUseCase {
+	return &FeedProcessingUseCase{
+		fetcher:   fetcher,
+		parser:    parser,
+		storage:   storage,
+		log:       log,
+		feedNames: feedNames,
+	}
+}
+
+// ProcessFeed выполняет полный цикл: получение, парсинг и сохранение фида.
+func (uc *FeedProcessingUseCase) ProcessFeed(ctx context.Context, url string) error {
+	start := time.Now()
+	feedName := uc.extractFeedName(url)
+	log := uc.log.With(
+		slog.String("component", "feed-processor"),
+		slog.String("feed", feedName),
+		slog.String("url", url),
+	)
+
+	log.Info("Processing feed started")
+
+	reader, err := uc.fetcher.Fetch(ctx, url)
+	if err != nil {
+		log.Error("Feed fetch failed",
+			slog.String("stage", "fetch"),
+			slog.Any("error", err),
+		)
+		return fmt.Errorf("fetch failed for %s: %w", feedName, err)
+	}
+	defer reader.Close()
+
+	log.Debug("Feed fetched successfully", slog.String("stage", "fetch"))
+
+	feed, err := uc.parser.Parse(ctx, reader)
+	if err != nil {
+		log.Error("Feed parsing failed",
+			slog.String("stage", "parse"),
+			slog.Any("error", err),
+		)
+		return fmt.Errorf("parse failed for %s: %w", feedName, err)
+	}
+
+	log.Debug("Feed parsed successfully",
+		slog.String("stage", "parse"),
+		slog.Int("items_parsed", len(feed.Items)),
+	)
+
+	savedCount, err := uc.storage.SaveNews(ctx, feed)
+	if err != nil {
+		log.Error("Feed save failed",
+			slog.String("stage", "save"),
+			slog.Any("error", err),
+		)
+		return fmt.Errorf("save failed for %s: %w", feedName, err)
+	}
+
+	duration := time.Since(start)
+	log.Info("Feed processing completed successfully",
+		slog.Int("items_found", len(feed.Items)),
+		slog.Int("items_saved", savedCount),
+		slog.Duration("duration", duration),
+	)
+
+	return nil
+}
+
+// extractFeedName извлекает читаемое имя фида из URL
+func (uc *FeedProcessingUseCase) extractFeedName(url string) string {
+	if name, ok := uc.feedNames[url]; ok {
+		return name
+	}
+	// Fallback: извлекает домен
+	parts := strings.Split(url, "/")
+	if len(parts) >= 3 {
+		domain := parts[2]
+		if strings.HasPrefix(domain, "www.") {
+			domain = domain[4:]
+		}
+		return domain
+	}
+	return "Unknown"
+}
+
+--- END FILE: ./internal/usecase/feedprocessing.go ---
+
+--- BEGIN FILE: ./internal/usecase/fetchfeed.go ---
+package usecase
+
+import (
+	"context"
+	"io"
+	"news/internal/domain"
+)
+
+// FeedFetcher — интерфейс для получения данных из источника.
+type FeedFetcher interface {
+	Fetch(ctx context.Context, url string) (io.ReadCloser, error)
+}
+
+// FeedParser — интерфейс для парсинга данных в доменную модель.
+type FeedParser interface {
+	Parse(ctx context.Context, reader io.Reader) (*domain.Feed, error)
+}
+
+// FeedStorage — интерфейс для сохранения фида.
+type FeedStorage interface {
+	SaveNews(ctx context.Context, feed *domain.Feed) (int, error)
+}
+
+--- END FILE: ./internal/usecase/fetchfeed.go ---
+
+--- BEGIN FILE: ./internal/adapter/parser/xmlparser.go ---
+package parser
+
+import (
+	"context"
+	"encoding/xml"
+	"fmt"
+	"io"
+	"log/slog"
+	"news/internal/domain"
+	"strings"
+	"time"
+)
+
+type rssXML struct {
+	Channel channelXML `xml:"channel"`
+}
+type channelXML struct {
+	Title       string    `xml:"title"`
+	Link        string    `xml:"link"`
+	Description string    `xml:"description"`
+	Items       []itemXML `xml:"item"`
+}
+type itemXML struct {
+	Title       string `xml:"title"`
+	Link        string `xml:"link"`
+	Description string `xml:"description"`
+	PubDate     string `xml:"pubDate"`
+}
+type XMLParser struct {
+	log *slog.Logger
+}
+
+func NewXMLParser(log *slog.Logger) *XMLParser {
+	return &XMLParser{
+		log: log,
+	}
+}
+
+// Parse реализует метод интерфейса FeedParser.
+func (p *XMLParser) Parse(ctx context.Context, reader io.Reader) (*domain.Feed, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var rss rssXML
+	decoder := xml.NewDecoder(reader)
+	if err := decoder.Decode(&rss); err != nil {
+		p.log.Error(
+			"Error decoding XML",
+			slog.Any("error", err),
+		)
+		return nil, fmt.Errorf("failed to decode XML: %w", err)
+	}
+	feed := domain.Feed{
+		Title:       rss.Channel.Title,
+		Link:        rss.Channel.Link,
+		Description: rss.Channel.Description,
+		Items:       make([]domain.Item, 0, len(rss.Channel.Items)),
+	}
+	for _, itemDTO := range rss.Channel.Items {
+		pubDate, err := parsePubDate(itemDTO.PubDate)
+		if err != nil {
+			p.log.Warn(
+				"could not parse item pubDate, skipping item",
+				slog.String("pubDate", itemDTO.PubDate),
+				slog.String("item_title", itemDTO.Title),
+				slog.Any("error", err),
+			)
+			continue
+		}
+		item := domain.Item{
+			Title:       itemDTO.Title,
+			Link:        itemDTO.Link,
+			Description: itemDTO.Description,
+			PubDate:     pubDate,
+		}
+		feed.Items = append(feed.Items, item)
+	}
+	return &feed, nil
+}
+
+// parsePubDate - вспомогательная функция для парсинга даты в разных форматах.
+func parsePubDate(dateStr string) (time.Time, error) {
+	formats := []string{
+		time.RFC1123Z,
+		time.RFC1123,
+		time.RFC822Z,
+		time.RFC822,
+		"Mon, 2 Jan 2006 15:04:05 -0700",
+	}
+	for _, format := range formats {
+		if t, err := time.Parse(format, strings.TrimSpace(dateStr)); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("could not parse date in any known format: %q", dateStr)
+}
+
+--- END FILE: ./internal/adapter/parser/xmlparser.go ---
+
+--- BEGIN FILE: ./internal/adapter/fetcher/httpfetcher.go ---
+package fetcher
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+)
+
+// HTTPFetcher — конкретная реализация FeedFetcher для получения данных по HTTP.
+type HTTPFetcher struct {
+	client *http.Client
+	log    *slog.Logger
+}
+
+func NewHTTPFetcher(log *slog.Logger) *HTTPFetcher {
+	return &HTTPFetcher{
+		client: http.DefaultClient,
+		log:    log,
+	}
+}
+
+// Fetch реализует метод интерфейса FeedFetcher.
+func (f *HTTPFetcher) Fetch(ctx context.Context, url string) (io.ReadCloser, error) {
+	log := f.log.With(slog.String("url", url))
+	log.Info("Fetching URL")
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		log.Error("Failed to create HTTP request", slog.Any("error", err))
+		return nil, fmt.Errorf("failed to create request for url %s: %w", url, err)
+	}
+	resp, err := f.client.Do(req)
+	if err != nil {
+		log.Error(
+			"HTTP request failed",
+			slog.Any("error", err),
+		)
+		return nil, fmt.Errorf("failed to fetch url %s: %w", url, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		log.Error(
+			"Unexpected status code",
+			slog.Int("status_code", resp.StatusCode),
+		)
+		return nil, fmt.Errorf("unexpected status code: %d for url %s", resp.StatusCode, url)
+	}
+	log.Info("Successfully fetched URL", slog.String("url", url))
+	return resp.Body, nil
+}
+
+--- END FILE: ./internal/adapter/fetcher/httpfetcher.go ---
+
+--- BEGIN FILE: ./internal/config/config.go ---
+package config
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"os"
+	"time"
+)
+
+type Config struct {
+	Server   ServerConfig   `json:"server"`
+	Logger   LoggerConfig   `json:"logger"`
+	App      AppConfig      `json:"app"`
+	Database DatabaseConfig `json:"database"`
+}
+type ServerConfig struct {
+	Address string `json:"address"`
+}
+type LoggerConfig struct {
+	Level string `json:"level"`
+}
+type FeedURL struct {
+	URL  string `json:"url"`
+	Name string `json:"name"`
+}
+type AppConfig struct {
+	DefaultNewsLimit   int       `json:"default_news_limit"`
+	FeedURLs           []FeedURL `json:"feed_urls"`
+	ProcessingInterval string    `json:"processing_interval"`
+}
+type DatabaseConfig struct {
+	Driver   string `json:"driver"`
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	DBName   string `json:"dbname"`
+	SSLMode  string `json:"sslmode"`
+}
+
+func (c *DatabaseConfig) DSN() string {
+	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s",
+		c.Username,
+		c.Password,
+		c.Host,
+		c.Port,
+		c.DBName,
+		c.SSLMode)
+}
+func Load(configPath string) (*Config, error) {
+	cfg := New()
+	fileData, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file %s: %w", configPath, err)
+	}
+	if err := json.Unmarshal(fileData, cfg); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON from file %s: %w", configPath, err)
+	}
+	return cfg, nil
+}
+func New() *Config {
+	return &Config{
+		Server: ServerConfig{
+			Address: ":8080",
+		},
+		Logger: LoggerConfig{
+			Level: "info",
+		},
+		App: AppConfig{
+			DefaultNewsLimit:   10,
+			ProcessingInterval: "3m",
+			FeedURLs:           []FeedURL{},
+		},
+		Database: DatabaseConfig{
+			Host:    "localhost",
+			Port:    5432,
+			SSLMode: "disable",
+		},
+	}
+}
+func (c *Config) Validate() error {
+	if c.Database.Host == "" {
+		return fmt.Errorf("database host is not set")
+	}
+	if c.Database.Username == "" {
+		return fmt.Errorf("database username is not set")
+	}
+	if c.Database.Password == "" {
+		return fmt.Errorf("database password is not set")
+	}
+	if c.App.DefaultNewsLimit <= 0 {
+		return fmt.Errorf("app.default_news_limit must be a positive number")
+	}
+	if len(c.App.FeedURLs) == 0 {
+		return fmt.Errorf("app_feed_urls must not be empty")
+	}
+	for _, feed := range c.App.FeedURLs {
+		if _, err := url.ParseRequestURI(feed.URL); err != nil {
+			return fmt.Errorf("invalid url in app.feed_urls: %s", feed.URL)
+		}
+		if feed.Name == "" {
+			return fmt.Errorf("feed name cannot be empty for url: %s", feed.URL)
+		}
+	}
+	if _, err := time.ParseDuration(c.App.ProcessingInterval); err != nil {
+		return fmt.Errorf("invalid app.processing_interval: %w", err)
+	}
+	return nil
+}
+
+--- END FILE: ./internal/config/config.go ---
+
+--- BEGIN FILE: ./internal/transport/http/server.go ---
+package http
+
+import (
+	"log/slog"
+	"net/http"
+	"path/filepath"
+)
+
+func NewServer(log *slog.Logger, h *Handler) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/news", h.getNews)
+	mux.HandleFunc("/api/health", h.healthCheck)
+	staticDir := "web/static/"
+	fs := http.FileServer(http.Dir(staticDir))
+	mux.Handle("/static/", http.StripPrefix("/static/", fs))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			http.ServeFile(w, r, filepath.Join(staticDir, "index.html"))
+			return
+		}
+		http.NotFound(w, r)
+	})
+	var handler http.Handler = mux
+	handler = loggingMiddleware(log)(handler)
+	handler = corsMiddleware()(handler)
+	return handler
+}
+
+// corsMiddleware добавляет CORS заголовки для работы фронтенда
+func corsMiddleware() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			if r.Method == "OPTIONS" {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+--- END FILE: ./internal/transport/http/server.go ---
+
+--- BEGIN FILE: ./internal/transport/http/middlewarer.go ---
+package http
+
+import (
+	"log/slog"
+	"net/http"
+	"time"
+)
+
+// loggingMiddleware логирует информацию о каждом запросе.
+func loggingMiddleware(log *slog.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			entry := log.With(
+				slog.String("component", "http"),
+				slog.String("method", r.Method),
+				slog.String("path", r.URL.Path),
+				slog.String("remote_addr", r.RemoteAddr),
+				slog.String("user_agent", r.UserAgent()),
+			)
+			entry.Info("request started")
+			start := time.Now()
+
+			next.ServeHTTP(w, r)
+
+			entry.Info("request completed",
+				slog.Duration("duration", time.Since(start)),
+			)
+		})
+	}
+}
+
+--- END FILE: ./internal/transport/http/middlewarer.go ---
+
+--- BEGIN FILE: ./internal/transport/http/handler.go ---
+package http
+
+import (
+	"context"
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"news/internal/domain"
+	"strconv"
+	"time"
+)
+
+type newsGetter interface {
+	GetNews(ctx context.Context, limit int) ([]domain.Item, error)
+}
+type Handler struct {
+	log        *slog.Logger
+	newsGetter newsGetter
+}
+
+func NewHandler(log *slog.Logger, getter newsGetter) *Handler {
+	return &Handler{
+		log:        log,
+		newsGetter: getter,
+	}
+}
+
+// getNews - хендлер для эндпоинта GET /api/news
+func (h *Handler) getNews(w http.ResponseWriter, r *http.Request) {
+	const op = "transport.http/getNews"
+	log := h.log.With(
+		slog.String("op", op),
+		slog.String("request_id", getRequestID(r.Context())),
+	)
+	if r.Method != http.MethodGet {
+		log.Warn("method not allowed")
+		respondWithError(w, http.StatusMethodNotAllowed, "Method Not Allowed")
+		return
+	}
+	limitStr := r.URL.Query().Get("limit")
+	limit := 10
+	if limitStr != "" {
+		var err error
+		limit, err = strconv.Atoi(limitStr)
+		if err != nil || limit <= 0 {
+			log.Warn("invalid limit parameter", slog.String("limit", limitStr))
+			respondWithError(w, http.StatusBadRequest, "Invalid 'limit' parameter")
+			return
+		}
+	}
+
+	news, err := h.newsGetter.GetNews(r.Context(), limit)
+	if err != nil {
+		log.Error("Failed to get news", slog.Any("error", err))
+		respondWithError(w, http.StatusInternalServerError, "Internal Server Error")
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, news)
+}
+
+// healthCheck - хендлер для проверки состояния сервиса
+func (h *Handler) healthCheck(w http.ResponseWriter, r *http.Request) {
+	respondWithJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// Вспомогательные функции для ответов
+func respondWithError(w http.ResponseWriter, code int, message string) {
+	respondWithJSON(w, code, map[string]string{"error": message})
+}
+func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
+	response, err := json.Marshal(payload)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error": "Failed to marshal JSON response"}`))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	w.Write(response)
+}
+func getRequestID(ctx context.Context) string {
+	return "req-" + time.Now().Format("20060102150405")
+}
+
+--- END FILE: ./internal/transport/http/handler.go ---
+

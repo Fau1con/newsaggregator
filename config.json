@@ -1,0 +1,27 @@
+{
+    "server": {
+        "address": ":8080"
+    },
+    "logger": {
+        "level": "info"
+    },
+    "app": {
+        "default_news_limit": 10,
+        "processing_interval": "3m",
+        "feed_urls": [
+            "https://dev.to/feed",
+            "http://feeds.bbci.co.uk/news/rss.xml",
+            "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+            "https://ria.ru/export/rss2/index.xml",
+            "https://www.kommersant.ru/RSS/news.xml"
+        ]
+    },
+    "database": {
+        "host": "localhost",
+        "port": 5432,
+        "username": "news",
+        "password": "password",
+        "dbname": "news_db",
+        "sslmode": "disable"
+    }
+}

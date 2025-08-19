@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Новостной агрегатор</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+            color: white;
+            padding: 2rem;
+            text-align: center;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .header::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: repeating-linear-gradient(
+                45deg,
+                transparent,
+                transparent 10px,
+                rgba(255, 255, 255, 0.05) 10px,
+                rgba(255, 255, 255, 0.05) 20px
+            );
+            animation: float 20s linear infinite;
+        }
+
+        @keyframes float {
+            0% { transform: translate(-50%, -50%) rotate(0deg); }
+            100% { transform: translate(-50%, -50%) rotate(360deg); }
+        }
+
+        .header h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+            position: relative;
+            z-index: 1;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+        }
+
+        .header p {
+            font-size: 1.1rem;
+            opacity: 0.9;
+            position: relative;
+            z-index: 1;
+        }
+
+        .controls {
+            padding: 2rem;
+            background: rgba(248, 250, 252, 0.8);
+            border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 1rem;
+        }
+
+        .limit-control {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .limit-control label {
+            font-weight: 600;
+            color: #4b5563;
+        }
+
+        .limit-control input {
+            padding: 0.75rem;
+            border: 2px solid #e5e7eb;
+            border-radius: 10px;
+            font-size: 1rem;
+            width: 80px;
+            text-align: center;
+            transition: all 0.3s ease;
+        }
+
+        .limit-control input:focus {
+            outline: none;
+            border-color: #4f46e5;
+            box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1);
+        }
+
+        .refresh-btn {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 10px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
+        }
+
+        .refresh-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(16, 185, 129, 0.4);
+        }
+
+        .refresh-btn:active {
+            transform: translateY(0);
+        }
+
+        .refresh-btn:disabled {
+            background: #9ca3af;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 3rem;
+            color: #6b7280;
+        }
+
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 4px solid #e5e7eb;
+            border-top: 4px solid #4f46e5;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 1rem;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .error {
+            background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+            color: white;
+            padding: 1.5rem;
+            margin: 2rem;
+            border-radius: 12px;
+            text-align: center;
+            box-shadow: 0 8px 20px rgba(239, 68, 68, 0.3);
+        }
+
+        .news-grid {
+            padding: 2rem;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .news-card {
+            background: white;
+            border-radius: 16px;
+            padding: 1.5rem;
+            box-shadow: 0 8px 25px rgba(0, 0, 0, 0.1);
+            transition: all 0.3s ease;
+            border: 1px solid rgba(0, 0, 0, 0.05);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .news-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: linear-gradient(90deg, #4f46e5, #7c3aed, #ec4899);
+        }
+
+        .news-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.15);
+        }
+
+        .news-title {
+            font-size: 1.25rem;
+            font-weight: 700;
+            margin-bottom: 1rem;
+            color: #1f2937;
+            line-height: 1.4;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+
+        .news-description {
+            color: #6b7280;
+            margin-bottom: 1rem;
+            line-height: 1.6;
+            display: -webkit-box;
+            -webkit-line-clamp: 3;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+
+        .news-meta {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+            padding-top: 1rem;
+            border-top: 1px solid #f3f4f6;
+        }
+
+        .news-date {
+            color: #9ca3af;
+            font-size: 0.875rem;
+            font-weight: 500;
+        }
+
+        .news-link {
+            background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+            color: white;
+            text-decoration: none;
+            padding: 0.5rem 1rem;
+            border-radius: 8px;
+            font-size: 0.875rem;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .news-link:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(79, 70, 229, 0.4);
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 4rem 2rem;
+            color: #6b7280;
+        }
+
+        .empty-icon {
+            width: 80px;
+            height: 80px;
+            margin: 0 auto 1rem;
+            opacity: 0.5;
+        }
+
+        .status-bar {
+            background: rgba(249, 250, 251, 0.9);
+            padding: 1rem 2rem;
+            border-top: 1px solid rgba(0, 0, 0, 0.1);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.875rem;
+            color: #6b7280;
+        }
+
+        @media (max-width: 768px) {
+            body {
+                padding: 10px;
+            }
+            
+            .header h1 {
+                font-size: 2rem;
+            }
+            
+            .controls {
+                flex-direction: column;
+                text-align: center;
+            }
+            
+            .news-grid {
+                grid-template-columns: 1fr;
+                padding: 1rem;
+            }
+            
+            .news-card {
+                padding: 1rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📰 Новостной агрегатор</h1>
+            <p>Актуальные новости из проверенных источников</p>
+        </div>
+
+        <div class="controls">
+            <div class="limit-control">
+                <label for="newsLimit">Количество новостей:</label>
+                <input type="number" id="newsLimit" min="1" max="50" value="10">
+            </div>
+            <button class="refresh-btn" onclick="loadNews()">
+                <span>🔄</span>
+                Обновить
+            </button>
+        </div>
+
+        <div id="content">
+            <!-- Здесь будет контент -->
+        </div>
+
+        <div class="status-bar">
+            <span id="lastUpdate">Последнее обновление: никогда</span>
+            <span id="newsCount">Новостей: 0</span>
+        </div>
+    </div>
+
+    <script>
+        let isLoading = false;
+
+        async function loadNews() {
+            if (isLoading) return;
+            
+            isLoading = true;
+            const refreshBtn = document.querySelector('.refresh-btn');
+            const content = document.getElementById('content');
+            const newsCount = document.getElementById('newsCount');
+            const lastUpdate = document.getElementById('lastUpdate');
+            const limit = document.getElementById('newsLimit').value;
+
+            // Отключаем кнопку и показываем загрузку
+            refreshBtn.disabled = true;
+            refreshBtn.innerHTML = '<span>⏳</span> Загрузка...';
+            
+            // Показываем спиннер
+            content.innerHTML = `
+                <div class="loading">
+                    <div class="spinner"></div>
+                    <p>Загружаем свежие новости...</p>
+                </div>
+            `;
+
+            try {
+                const response = await fetch(`http://localhost:8080/api/news?limit=${limit}`);
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+
+                const news = await response.json();
+                displayNews(news);
+                
+                // Обновляем статус
+                newsCount.textContent = `Новостей: ${news.length}`;
+                lastUpdate.textContent = `Последнее обновление: ${new Date().toLocaleString('ru-RU')}`;
+                
+            } catch (error) {
+                console.error('Ошибка загрузки новостей:', error);
+                content.innerHTML = `
+                    <div class="error">
+                        <h3>❌ Ошибка загрузки</h3>
+                        <p>Не удалось загрузить новости: ${error.message}</p>
+                        <p style="margin-top: 1rem; font-size: 0.9rem; opacity: 0.8;">
+                            Убедитесь, что сервер запущен на порту 8080
+                        </p>
+                    </div>
+                `;
+                newsCount.textContent = 'Новостей: 0';
+            } finally {
+                // Возвращаем кнопку в исходное состояние
+                isLoading = false;
+                refreshBtn.disabled = false;
+                refreshBtn.innerHTML = '<span>🔄</span> Обновить';
+            }
+        }
+
+        function displayNews(news) {
+            const content = document.getElementById('content');
+
+            if (!news || news.length === 0) {
+                content.innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-icon">📰</div>
+                        <h3>Новостей пока нет</h3>
+                        <p>Попробуйте обновить страницу или проверьте настройки фидов</p>
+                    </div>
+                `;
+                return;
+            }
+
+            const newsGrid = news.map(item => {
+                const pubDate = new Date(item.PubDate);
+                const formattedDate = pubDate.toLocaleString('ru-RU', {
+                    year: 'numeric',
+                    month: 'short',
+                    day: 'numeric',
+                    hour: '2-digit',
+                    minute: '2-digit'
+                });
+
+                return `
+                    <div class="news-card">
+                        <h3 class="news-title">${escapeHtml(item.Title)}</h3>
+                        <p class="news-description">${escapeHtml(item.Description)}</p>
+                        <div class="news-meta">
+                            <span class="news-date">📅 ${formattedDate}</span>
+                            <a href="${escapeHtml(item.Link)}" target="_blank" class="news-link">
+                                Читать далее →
+                            </a>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+
+            content.innerHTML = `<div class="news-grid">${newsGrid}</div>`;
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Обработчик Enter в поле лимита
+        document.getElementById('newsLimit').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                loadNews();
+            }
+        });
+
+        // Автообновление каждые 5 минут
+        setInterval(loadNews, 5 * 60 * 1000);
+
+        // Загружаем новости при загрузке страницы
+        window.addEventListener('load', loadNews);
+    </script>
+</body>
+</html>
