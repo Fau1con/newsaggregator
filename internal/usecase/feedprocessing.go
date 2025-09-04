@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+// FeedProcessingUseCase реализует бизнес-логику обработки RSS-лент.
+// Координирует процесс загрузки, парсинга и сохранения новостей.
 type FeedProcessingUseCase struct {
 	fetcher   FeedFetcher
 	parser    FeedParser
@@ -16,6 +18,8 @@ type FeedProcessingUseCase struct {
 	feedNames map[string]string
 }
 
+// NewFeedProcessingUseCase создает новый экземпляр UseCase для обработки RSS-лент.
+// Принимает зависимости: загрузчик, парсер, хранилище, логгер и маппинг URL на имена.
 func NewFeedProcessingUseCase(
 	fetcher FeedFetcher,
 	parser FeedParser,
@@ -32,7 +36,9 @@ func NewFeedProcessingUseCase(
 	}
 }
 
-// ProcessFeed выполняет полный цикл: получение, парсинг и сохранение фида.
+// ProcessFeed выполняет полный цикл обработки RSS-ленты: получение, парсинг и сохранение.
+// Измеряет время выполнения, логирует этапы процесса и обрабатывает ошибки на каждом этапе.
+// Возвращает ошибку в случае сбоя любой из операций (загрузка, парсинг или сохранение).
 func (uc *FeedProcessingUseCase) ProcessFeed(ctx context.Context, url string) error {
 	start := time.Now()
 	feedName := uc.extractFeedName(url)
@@ -89,7 +95,8 @@ func (uc *FeedProcessingUseCase) ProcessFeed(ctx context.Context, url string) er
 	return nil
 }
 
-// extractFeedName извлекает читаемое имя фида из URL
+// extractFeedName извлекает читаемое имя фида из URL.
+// Использует предопределенный маппинг или извлекает домен из URL как fallback.
 func (uc *FeedProcessingUseCase) extractFeedName(url string) string {
 	if name, ok := uc.feedNames[url]; ok {
 		return name

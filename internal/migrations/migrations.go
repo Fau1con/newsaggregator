@@ -9,11 +9,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Наипростейшее решениеб чтобы уйти от schema
+
+// Migration представляет отдельную миграцию базы данных.
+// Содержит уникальный идентификатор и SQL-запрос для применения изменений.
 type Migration struct {
 	ID    string
 	UpSQL string
 }
 
+// allMigrations содержит все доступные миграции базы данных в правильном порядке.
+// Миграции сортируются по ID перед применением для обеспечения последовательности.
 var allMigrations = []Migration{
 	{
 		ID: "020231120120000_create_news_table",
@@ -29,6 +35,9 @@ var allMigrations = []Migration{
 }
 
 // Apply применяет все необходимые миграции к базе данных.
+// Проверяет уже примененные миграции, сортирует доступные миграции по ID,
+// и применяет только те, которые еще не были применены. Использует транзакцию
+// для атомарности операций миграции. Возвращает ошибку в случае сбоя любой из операций.
 func Apply(ctx context.Context, log *slog.Logger, pool *pgxpool.Pool) error {
 	log = log.With(slog.String("component", "migrations"))
 	log.Info("Starting database migrations check...")

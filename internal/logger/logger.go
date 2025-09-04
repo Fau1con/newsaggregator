@@ -17,6 +17,10 @@ const (
 	errorLogFile = "news_error.log"
 )
 
+// New создает и настраивает логгер приложения на основе конфигурации.
+// Открывает файлы для обычных логов и ошибок, настраивает обработчики
+// с маршрутизацией по уровням и применяет параметры форматирования.
+// Возвращает ошибку при проблемах с созданием файлов логов.
 func New(cfg config.LoggerConfig) (*slog.Logger, error) {
 	logLevel := parseLogLevel(cfg.Level)
 	logWriter, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
@@ -42,7 +46,8 @@ func New(cfg config.LoggerConfig) (*slog.Logger, error) {
 	return slog.New(handler), nil
 }
 
-// parseLogLevel преобразует строку из конфига в уровень slog.
+// parseLogLevel преобразует строковое представление уровня логирования в тип slog.Level.
+// Поддерживает уровни: debug, info, warn, error.
 func parseLogLevel(levelStr string) slog.Level {
 	switch levelStr {
 	case "debug":
@@ -58,32 +63,50 @@ func parseLogLevel(levelStr string) slog.Level {
 	}
 }
 
+// LevelDispatcherHandler реализует slog.Handler с маршрутизацией сообщений по уровням.
+// Сообщения уровня ERROR и выше направляются в errorHandlers, остальные - в defaultHandler.
 type LevelDispatcherHandler struct {
 	defaultHandler slog.Handler
 	errorHandlers  slog.Handler
 }
 
+// NewLevelDispatcherHandler создает новый обработчик логов с маршрутизацией по уровням.
+// Сообщения с уровнем ERROR и выше направляются в errorOut, остальные - в defaultOut.
+// Позволяет разделять вывод ошибок и обычных сообщений для удобства мониторинга.
 func NewLevelDispatcherHandler(defaultOut, errorOut io.Writer, opts *slog.HandlerOptions) *LevelDispatcherHandler {
 	return &LevelDispatcherHandler{
 		defaultHandler: NewReadableHandler(defaultOut, opts),
 		errorHandlers:  NewReadableHandler(errorOut, opts),
 	}
 }
+
+// Enabled определяет, обрабатывается ли указанный уровень логирования.
+// Использует настройки уровня из defaultHandler для согласованности.
 func (h *LevelDispatcherHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	return h.defaultHandler.Enabled(ctx, level)
 }
+
+// Handle обрабатывает запись лога, направляя её в соответствующий обработчик.
+// Сообщения уровня ERROR и выше направляются в errorHandlers,
+// остальные сообщения обрабатываются defaultHandler.
 func (h *LevelDispatcherHandler) Handle(ctx context.Context, r slog.Record) error {
 	if r.Level >= slog.LevelError {
 		return h.errorHandlers.Handle(ctx, r)
 	}
 	return h.defaultHandler.Handle(ctx, r)
 }
+
+// WithAttrs создает новый обработчик с добавленными атрибутами.
+// Распространяет атрибуты на оба внутренних обработчика для согласованности.
 func (h *LevelDispatcherHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	return &LevelDispatcherHandler{
 		defaultHandler: h.defaultHandler.WithAttrs(attrs),
 		errorHandlers:  h.errorHandlers.WithAttrs(attrs),
 	}
 }
+
+// WithGroup создает новый обработчик с добавленной группой атрибутов.
+// Распространяет группу на оба внутренних обработчика.
 func (h *LevelDispatcherHandler) WithGroup(name string) slog.Handler {
 	return &LevelDispatcherHandler{
 		defaultHandler: h.defaultHandler.WithGroup(name),
@@ -91,20 +114,32 @@ func (h *LevelDispatcherHandler) WithGroup(name string) slog.Handler {
 	}
 }
 
+// ReadableHandler реализует slog.Handler с удобочитаемым форматированием логов.
+// Форматирует сообщения в человекочитаемом виде с временными метками,
+// уровнями логирования, компонентами и структурированными атрибутами.
 type ReadableHandler struct {
 	w    io.Writer
 	opts *slog.HandlerOptions
 }
 
+// NewReadableHandler создает новый обработчик с читаемым форматированием.
+// Если opts равен nil, используются настройки по умолчанию.
 func NewReadableHandler(w io.Writer, opts *slog.HandlerOptions) *ReadableHandler {
 	if opts == nil {
 		opts = &slog.HandlerOptions{}
 	}
 	return &ReadableHandler{w: w, opts: opts}
 }
+
+// Enabled определяет, обрабатывается ли указанный уровень логирования.
+// Учитывает минимальный уровень, установленный в опциях обработчика.
 func (h *ReadableHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	return level >= h.opts.Level.Level()
 }
+
+// Handle форматирует и записывает запись лога в удобочитаемом формате.
+// Включает время, уровень, компонент, операцию, источник и атрибуты.
+// Сообщения форматируются в едином стиле для удобства чтения и анализа.
 func (h *ReadableHandler) Handle(ctx context.Context, r slog.Record) error {
 	timeStr := r.Time.Format("15:04:05.000")
 	levelStr := h.formatLevel(r.Level)
@@ -147,6 +182,9 @@ func (h *ReadableHandler) Handle(ctx context.Context, r slog.Record) error {
 	_, err := fmt.Fprintf(h.w, "%s: %s\n", prefix.String(), message)
 	return err
 }
+
+// formatLevel преобразует уровень логирования в строковое представление.
+// Использует заглавные буквы для consistency с общепринятыми практиками.
 func (h *ReadableHandler) formatLevel(level slog.Level) string {
 	switch level {
 	case slog.LevelDebug:
@@ -161,6 +199,10 @@ func (h *ReadableHandler) formatLevel(level slog.Level) string {
 		return "UNKNW"
 	}
 }
+
+// formatAttr форматирует атрибут лога в зависимости от его типа и ключа.
+// Специальное форматирование для ошибок, URL, длительностей и числовых значений.
+// Обеспечивает единообразное представление часто используемых атрибутов.
 func (h *ReadableHandler) formatAttr(attr slog.Attr) string {
 	switch attr.Key {
 	case "error":
@@ -178,6 +220,9 @@ func (h *ReadableHandler) formatAttr(attr slog.Attr) string {
 		return fmt.Sprintf("%s=%s", attr.Key, attr.Value.String())
 	}
 }
+
+// shortenURL сокращает длинные URL для удобства чтения в логах.
+// Обрезает URL до 50 символов, оставляя только схему и домен.
 func (h *ReadableHandler) shortenURL(url string) string {
 	if len(url) > 50 {
 		parts := strings.Split(url, "/")
@@ -187,9 +232,15 @@ func (h *ReadableHandler) shortenURL(url string) string {
 	}
 	return url
 }
+
+// WithAttrs возвращает тот же обработчик без изменений.
+// Реализация интерфейса slog.Handler для совместимости.
 func (h *ReadableHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	return h
 }
+
+// WithGroup возвращает тот же обработчик без изменений.
+// Реализация интерфейса slog.Handler для совместимости.
 func (h *ReadableHandler) WithGroup(name string) slog.Handler {
 	return h
 }

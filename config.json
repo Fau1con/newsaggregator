@@ -9,11 +9,9 @@
         "default_news_limit": 10,
         "processing_interval": "3m",
         "feed_urls": [
-            "https://dev.to/feed",
-            "http://feeds.bbci.co.uk/news/rss.xml",
-            "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
-            "https://ria.ru/export/rss2/index.xml",
-            "https://www.kommersant.ru/RSS/news.xml"
+            {"name": "dev.to", "url": "https://dev.to/feed"},
+            {"name": "ria.ru", "url": "https://ria.ru/export/rss2/index.xml"},
+            {"name": "kommersant.ru", "url": "https://www.kommersant.ru/RSS/news.xml"}
         ]
     },
     "database": {

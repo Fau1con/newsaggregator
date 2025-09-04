@@ -6,7 +6,8 @@ import (
 	"time"
 )
 
-// loggingMiddleware логирует информацию о каждом запросе.
+// loggingMiddleware создает middleware для логирования информации о HTTP-запросах.
+// Логирует метод, путь, IP-адрес, user-agent и время выполнения запроса.
 func loggingMiddleware(log *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

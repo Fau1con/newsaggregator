@@ -11,32 +11,47 @@ import (
 	"time"
 )
 
+// rssXML представляет структуру RSS-ленты в XML формате.
+// Используется для декодирования XML данных в Go структуры.
 type rssXML struct {
 	Channel channelXML `xml:"channel"`
 }
+
+// channelXML представляет канал RSS-ленты с заголовком, ссылкой, описанием и элементами.
 type channelXML struct {
 	Title       string    `xml:"title"`
 	Link        string    `xml:"link"`
 	Description string    `xml:"description"`
 	Items       []itemXML `xml:"item"`
 }
+
+// itemXML представляет отдельный элемент (новость) в RSS-ленте.
+// Содержит заголовок, ссылку, описание и дату публикации.
 type itemXML struct {
 	Title       string `xml:"title"`
 	Link        string `xml:"link"`
 	Description string `xml:"description"`
 	PubDate     string `xml:"pubDate"`
 }
+
+// XMLParser реализует парсер RSS-лент в XML формате.
+// Обрабатывает различные форматы дат и обеспечивает отказоустойчивость при парсинге.
 type XMLParser struct {
 	log *slog.Logger
 }
 
+// NewXMLParser создает новый экземпляр XMLParser для обработки RSS-лент.
+// Принимает логгер для записи событий парсинга и ошибок.
 func NewXMLParser(log *slog.Logger) *XMLParser {
 	return &XMLParser{
 		log: log,
 	}
 }
 
-// Parse реализует метод интерфейса FeedParser.
+// Parse преобразует XML данные RSS-ленты в доменную модель Feed.
+// Обрабатывает контекст для отмены операции, парсит элементы ленты,
+// конвертирует даты из различных форматов и фильтрует некорректные элементы.
+// Возвращает ошибку при проблемах с декодированием XML или форматом данных.
 func (p *XMLParser) Parse(ctx context.Context, reader io.Reader) (*domain.Feed, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -78,7 +93,9 @@ func (p *XMLParser) Parse(ctx context.Context, reader io.Reader) (*domain.Feed, 
 	return &feed, nil
 }
 
-// parsePubDate - вспомогательная функция для парсинга даты в разных форматах.
+// parsePubDate преобразует строку даты из RSS в объект time.Time.
+// Поддерживает multiple форматы дат, включая RFC1123, RFC822 и другие распространенные варианты.
+// Возвращает ошибку если ни один из форматов не подходит для парсинга.
 func parsePubDate(dateStr string) (time.Time, error) {
 	formats := []string{
 		time.RFC1123Z,

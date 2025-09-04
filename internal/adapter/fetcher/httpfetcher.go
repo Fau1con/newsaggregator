@@ -8,12 +8,16 @@ import (
 	"net/http"
 )
 
-// HTTPFetcher — конкретная реализация FeedFetcher для получения данных по HTTP.
+// HTTPFetcher реализует интерфейс FeedFetcher для загрузки RSS-лент по HTTP.
+// Содержит HTTP-клиент для выполнения запросов и логгер для записи событий.
+// Обеспечивает обработку ошибок сети, таймаутов и HTTP-статусов.
 type HTTPFetcher struct {
 	client *http.Client
 	log    *slog.Logger
 }
 
+// NewHTTPFetcher создает новый экземпляр HTTPFetcher для загрузки RSS-лент.
+// Использует стандартный HTTP-клиент и переданный логгер для записи событий.
 func NewHTTPFetcher(log *slog.Logger) *HTTPFetcher {
 	return &HTTPFetcher{
 		client: http.DefaultClient,
@@ -21,7 +25,10 @@ func NewHTTPFetcher(log *slog.Logger) *HTTPFetcher {
 	}
 }
 
-// Fetch реализует метод интерфейса FeedFetcher.
+// Fetch выполняет HTTP-запрос для получения RSS-ленты по указанному URL.
+// Принимает контекст для контроля времени выполнения и отмены операции.
+// Возвращает тело ответа как io.ReadCloser, которое должно быть закрыто после использования.
+// В случае ошибки возвращает детальное описание проблемы с учетом HTTP-статуса и сетевых ошибок.
 func (f *HTTPFetcher) Fetch(ctx context.Context, url string) (io.ReadCloser, error) {
 	log := f.log.With(slog.String("url", url))
 	log.Info("Fetching URL")

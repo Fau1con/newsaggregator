@@ -11,12 +11,16 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// PostgresNewsDB реализует хранение новостей в PostgreSQL.
+// Использует connection pool для эффективного управления соединениями.
 type PostgresNewsDB struct {
 	pool             *pgxpool.Pool
 	log              *slog.Logger
 	defaultNewsLimit int
 }
 
+// NewPostgresNewsDB создает новый экземпляр хранилища PostgreSQL.
+// Принимает пул соединений, конфигурацию приложения и логгер.
 func NewPostgresNewsDB(pool *pgxpool.Pool, appCfg config.AppConfig, log *slog.Logger) *PostgresNewsDB {
 	log.Info("Initializing Postgres news storage")
 	return &PostgresNewsDB{
@@ -25,12 +29,17 @@ func NewPostgresNewsDB(pool *pgxpool.Pool, appCfg config.AppConfig, log *slog.Lo
 		defaultNewsLimit: appCfg.DefaultNewsLimit,
 	}
 }
+
+// Close закрывает пул соединений с базой данных.
+// Должен вызываться при завершении работы приложения.
 func (db *PostgresNewsDB) Close() {
 	db.log.Info("Closing database connection pool")
 	db.pool.Close()
 }
 
-// SaveNews
+// SaveNews сохраняет новости из RSS-ленты в базу данных.
+// Использует батчевую вставку для эффективности и обработку конфликтов по ссылкам.
+// Возвращает количество сохраненных элементов и ошибку в случае неудачи.
 func (db *PostgresNewsDB) SaveNews(ctx context.Context, feed *domain.Feed) (int, error) {
 	if len(feed.Items) == 0 {
 		return 0, nil
@@ -79,6 +88,10 @@ func (db *PostgresNewsDB) SaveNews(ctx context.Context, feed *domain.Feed) (int,
 	}
 	return len(feed.Items), nil
 }
+
+// GetNews возвращает список новостей из базы данных с ограничением по количеству.
+// Сортирует новости по дате публикации (новые сначала).
+// Использует значение по умолчанию если передан невалидный лимит.
 func (db *PostgresNewsDB) GetNews(ctx context.Context, n int) ([]domain.Item, error) {
 	limit := n
 	if limit <= 0 {
@@ -97,6 +110,9 @@ func (db *PostgresNewsDB) GetNews(ctx context.Context, n int) ([]domain.Item, er
 	if err != nil {
 		log.Error("Database query failed", slog.Any("error", err))
 		return nil, fmt.Errorf("%s: failed to execute query: %w", op, err)
+	}
+	if rows != nil {
+		defer rows.Close()
 	}
 	defer rows.Close()
 	items, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (domain.Item, error) {
